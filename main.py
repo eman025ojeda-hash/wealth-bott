@@ -3,25 +3,57 @@ import re
 import json
 import base64
 import logging
+import asyncio
+import threading
 from datetime import datetime
+
 import httpx
+import uvicorn
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 
 logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+BOT_TOKEN  = os.environ.get("BOT_TOKEN", "")
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "")
-GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "AIzaSyAXRORlJ4hJvZRi0XZZrqBUiaAQe8X7cV8")
+PORT       = int(os.environ.get("PORT", 8000))
 GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_KEY}"
 
+# ── SHARED DATA ────────────────────────────────────────────────
 EXPENSES = []
 COUNTER  = [0]
-PENDING  = {}  # store pending confirmations per user
+PENDING  = {}
 
+# ── FASTAPI (web server so app can read expenses) ──────────────
+api = FastAPI()
+api.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@api.get("/")
+def root():
+    return {"status": "Wealth+ Bot is running!", "expenses": len(EXPENSES)}
+
+@api.get("/expenses")
+def get_expenses():
+    return {"expenses": EXPENSES, "total": sum(e["amount"] for e in EXPENSES)}
+
+@api.get("/today")
+def get_today():
+    today = datetime.now().strftime("%Y-%m-%d")
+    today_exp = [e for e in EXPENSES if e["date"].startswith(today)]
+    return {"expenses": today_exp, "total": sum(e["amount"] for e in today_exp)}
+
+# ── CATEGORY KEYWORDS ──────────────────────────────────────────
 CAT_KEYWORDS = {
-    "Food":          ["jollibee","mcdo","mcdonald","kfc","chowking","mang inasal","ministop","711","7-eleven","grocery","groceries","palengke","market","food","lunch","dinner","breakfast","merienda","snack","restaurant","cafe","pizza","burger","siomai","lugaw"],
-    "Transport":     ["grab","angkas","jeep","jeepney","tricycle","bus","lrt","mrt","taxi","uber","pedicab","toll","gas","petrol","gasoline","diesel","fare","commute","transport"],
+    "Food":          ["jollibee","mcdo","mcdonald","kfc","chowking","mang inasal","ministop","711","7-eleven","grocery","groceries","palengke","market","food","lunch","dinner","breakfast","merienda","snack","restaurant","cafe","pizza","burger"],
+    "Transport":     ["grab","angkas","jeep","jeepney","tricycle","bus","lrt","mrt","taxi","uber","toll","gas","petrol","gasoline","diesel","fare","commute","transport"],
     "Utilities":     ["meralco","electricity","water","maynilad","nawasa","internet","wifi","globe","smart","dito","pldt","load","prepaid","bill","bills"],
     "Shopping":      ["sm","robinsons","ayala","lazada","shopee","shop","mall","clothes","shoes","clothing","divisoria","ukay","aquaflask","greenhills"],
     "Healthcare":    ["mercury","watsons","rose pharmacy","hospital","clinic","doctor","medicine","botika","pharmacy","checkup","dental","optical"],
@@ -50,7 +82,7 @@ def parse_locally(text):
         name_part = "Expense"
     return {"name": name_part.title(), "amount": amount, "category": guess_category(name_part), "note": ""}
 
-def add_expense(name, amount, category="Other", note=""):
+def add_expense(name, amount, category="Other", note="", source="manual"):
     COUNTER[0] += 1
     entry = {
         "id": COUNTER[0],
@@ -59,56 +91,48 @@ def add_expense(name, amount, category="Other", note=""):
         "category": str(category),
         "note": str(note),
         "date": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "source": source,
     }
     EXPENSES.append(entry)
     return entry
 
 # ── GEMINI ─────────────────────────────────────────────────────
 async def ask_gemini_image(image_bytes):
+    if not GEMINI_KEY:
+        logger.warning("No Gemini key set!")
+        return None
     try:
         b64 = base64.standard_b64encode(image_bytes).decode()
-        prompt = """This is a receipt or payment slip. Extract:
-1. Merchant/store name
-2. Total amount paid (in Philippine Peso)
-3. Category
+        prompt = """This is a receipt or payment slip from the Philippines.
+Find: 1) Merchant/store name  2) Total amount paid in Philippine Peso  3) Category
 
-Return ONLY this JSON with no extra text or markdown:
+Return ONLY this JSON with no extra text:
 {"name":"MERCHANT","amount":210.00,"category":"Shopping","note":"description"}
 
 Categories: Food, Transport, Utilities, Shopping, Entertainment, Healthcare, Other
-
-For card slips, look for SALE AMOUNT or TOTAL. Merchant is usually at the top."""
+For card slips look for SALE AMOUNT. Merchant name is usually at the top."""
 
         contents = [{"parts": [
             {"inline_data": {"mime_type": "image/jpeg", "data": b64}},
             {"text": prompt}
         ]}]
-
         async with httpx.AsyncClient(timeout=30) as client:
             res = await client.post(GEMINI_URL, json={"contents": contents})
             data = res.json()
-            logger.info(f"Gemini raw: {data}")
-
+            logger.info(f"Gemini response: {data}")
             if "candidates" not in data:
-                logger.error(f"No candidates in Gemini response: {data}")
                 return None
-
             text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
-            logger.info(f"Gemini text: {text}")
-
-            # Extract JSON from response
             json_match = re.search(r'\{[^{}]+\}', text, re.DOTALL)
             if json_match:
-                parsed = json.loads(json_match.group(0))
-                logger.info(f"Parsed receipt: {parsed}")
-                return parsed
-            return None
+                return json.loads(json_match.group(0))
     except Exception as e:
-        logger.error(f"Gemini image error: {e}")
-        return None
+        logger.error(f"Gemini error: {e}")
+    return None
 
-# ── COMMANDS ───────────────────────────────────────────────────
+# ── BOT COMMANDS ───────────────────────────────────────────────
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    railway_url = os.environ.get("RAILWAY_PUBLIC_DOMAIN", "your-app.railway.app")
     await update.message.reply_text(
         "Hi Jon! Wealth+ Bot here! 🇵🇭\n\n"
         "📸 Send a receipt photo and I'll record it!\n\n"
@@ -121,9 +145,20 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/expenses - recent list\n"
         "/total - by category\n"
         "/today - today only\n"
-        "/delete 5 - remove #5\n\n"
+        "/delete 5 - remove #5\n"
+        f"/link - get your app sync URL\n\n"
         "Let's track those pesos! 💪"
     )
+
+async def link_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    railway_url = os.environ.get("RAILWAY_PUBLIC_DOMAIN", "")
+    if railway_url:
+        await update.message.reply_text(
+            f"Your sync URL:\nhttps://{railway_url}/expenses\n\n"
+            "Add this URL in your Wealth+ app under Settings → Bot Sync URL to see all bot expenses in the app!"
+        )
+    else:
+        await update.message.reply_text("Sync URL not set yet. Make sure RAILWAY_PUBLIC_DOMAIN is set in Railway Variables.")
 
 async def expenses_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not EXPENSES:
@@ -167,7 +202,7 @@ async def delete_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             EXPENSES.remove(to_remove)
             await update.message.reply_text(f"Deleted #{exp_id} {to_remove['name']}!")
         else:
-            await update.message.reply_text(f"#{exp_id} not found. Use /expenses to see IDs.")
+            await update.message.reply_text(f"#{exp_id} not found.")
     except:
         await update.message.reply_text("Usage: /delete 5")
 
@@ -183,14 +218,13 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
 
         if result and result.get("amount", 0) > 0:
-            # Got a result — ask user to confirm
             PENDING[user_id] = result
             keyboard = [[
                 InlineKeyboardButton("✅ Yes, save it!", callback_data="confirm_yes"),
-                InlineKeyboardButton("❌ No, cancel", callback_data="confirm_no"),
+                InlineKeyboardButton("❌ Cancel", callback_data="confirm_no"),
             ]]
             await update.message.reply_text(
-                f"I found this from your receipt:\n\n"
+                f"Found this from your receipt:\n\n"
                 f"🏪 Store: {result.get('name','?')}\n"
                 f"💸 Amount: P{float(result.get('amount',0)):,.2f}\n"
                 f"📂 Category: {result.get('category','?')}\n\n"
@@ -198,43 +232,37 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=InlineKeyboardMarkup(keyboard)
             )
         else:
-            # Gemini failed — ask user to type it
             await update.message.reply_text(
-                "I couldn't read the receipt clearly.\n\n"
+                "Couldn't read the receipt clearly.\n\n"
                 "Please type it manually:\n"
-                "Example: 210 Aquaflask\n\n"
-                "Format: [amount] [store name]\n"
                 "• 210 Aquaflask\n"
-                "• 1500 Meralco\n"
-                "• 350 SM Grocery"
+                "• 350 SM Grocery\n"
+                "• 1500 Meralco"
             )
     except Exception as e:
         logger.error(f"Photo error: {e}")
-        await update.message.reply_text("Error reading photo. Please type it manually:\nExample: 210 Aquaflask")
+        await update.message.reply_text("Error reading photo. Please type it manually!")
 
-# ── CALLBACK HANDLER (confirm buttons) ────────────────────────
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     user_id = query.from_user.id
-
     if query.data == "confirm_yes":
         result = PENDING.pop(user_id, None)
         if result:
-            entry = add_expense(result.get("name","Unknown"), result.get("amount",0), result.get("category","Shopping"), result.get("note",""))
+            entry = add_expense(result.get("name","Unknown"), result.get("amount",0), result.get("category","Shopping"), result.get("note",""), source="receipt")
             await query.edit_message_text(
                 f"Saved! ✅\n\n"
                 f"🏪 {entry['name']}\n"
                 f"💸 P{entry['amount']:,.2f}\n"
                 f"📂 {entry['category']}\n"
                 f"📅 {entry['date']}\n\n"
-                f"#{entry['id']} recorded! /today to review."
+                f"#{entry['id']} recorded!"
             )
     elif query.data == "confirm_no":
         PENDING.pop(user_id, None)
-        await query.edit_message_text("Cancelled. Type the expense manually:\nExample: 210 Aquaflask")
+        await query.edit_message_text("Cancelled. Type manually:\nExample: 210 Aquaflask")
 
-# ── TEXT HANDLER ───────────────────────────────────────────────
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         text = update.message.text.strip()
@@ -251,27 +279,36 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "Or send a receipt photo! 📸"
             )
             return
-        entry = add_expense(result["name"], result["amount"], result["category"], result.get("note",""))
+        entry = add_expense(result["name"], result["amount"], result["category"], result.get("note",""), source="text")
         await update.message.reply_text(
             f"Saved! ✅\n\n"
             f"🏪 Store: {entry['name']}\n"
             f"💸 Amount: P{entry['amount']:,.2f}\n"
             f"📂 Category: {entry['category']}\n"
             f"📅 Date: {entry['date']}\n\n"
-            f"#{entry['id']} recorded! /today to review."
+            f"#{entry['id']} recorded!"
         )
     except Exception as e:
         logger.error(f"Text error: {e}")
         await update.message.reply_text("Error. Try again!")
 
-# ── MAIN ───────────────────────────────────────────────────────
+# ── RUN BOTH BOT + WEB SERVER ──────────────────────────────────
+def run_api():
+    uvicorn.run(api, host="0.0.0.0", port=PORT)
+
 def main():
-    logger.info("Starting Wealth+ Bot...")
-    logger.info(f"BOT_TOKEN set: {bool(BOT_TOKEN)}")
-    logger.info(f"GEMINI_KEY set: {bool(GEMINI_KEY)}")
+    logger.info("Starting Wealth+ Bot + API...")
+
+    # Start web server in background thread
+    api_thread = threading.Thread(target=run_api, daemon=True)
+    api_thread.start()
+    logger.info(f"Web API running on port {PORT}")
+
+    # Start Telegram bot
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start",    start))
     app.add_handler(CommandHandler("help",     start))
+    app.add_handler(CommandHandler("link",     link_cmd))
     app.add_handler(CommandHandler("expenses", expenses_cmd))
     app.add_handler(CommandHandler("total",    total_cmd))
     app.add_handler(CommandHandler("today",    today_cmd))
