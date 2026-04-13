@@ -47,6 +47,25 @@ def get_today():
     today_exp = [e for e in EXPENSES if e["date"].startswith(today)]
     return {"expenses": today_exp, "total": sum(e["amount"] for e in today_exp)}
 
+@api.get("/loans")
+def get_loans():
+    return {"loans": LOANS}
+
+@api.get("/all")
+def get_all():
+    today = datetime.now(PH_TZ).strftime("%Y-%m-%d")
+    today_exp = [e for e in EXPENSES if e["date"].startswith(today)]
+    by_cat = {}
+    for e in EXPENSES:
+        by_cat[e["category"]] = by_cat.get(e["category"], 0) + e["amount"]
+    return {
+        "expenses": EXPENSES,
+        "loans": LOANS,
+        "total_spent": sum(e["amount"] for e in EXPENSES),
+        "today_spent": sum(e["amount"] for e in today_exp),
+        "by_category": by_cat,
+    }
+
 # ── HELPERS ────────────────────────────────────────────────────
 CAT_KEYWORDS = {
     "Food":          ["jollibee","mcdo","mcdonald","kfc","chowking","mang inasal","ministop","711","7-eleven","grocery","groceries","palengke","market","food","lunch","dinner","breakfast","merienda","snack","restaurant","cafe","pizza","burger"],
