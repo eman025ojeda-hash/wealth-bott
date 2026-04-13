@@ -4,7 +4,6 @@ import json
 import base64
 import logging
 import asyncio
-import threading
 from datetime import datetime
 
 import httpx
@@ -22,19 +21,13 @@ GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "")
 PORT       = int(os.environ.get("PORT", 8000))
 GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_KEY}"
 
-# ── SHARED DATA ────────────────────────────────────────────────
 EXPENSES = []
 COUNTER  = [0]
 PENDING  = {}
 
-# ── FASTAPI (web server so app can read expenses) ──────────────
+# ── FASTAPI ────────────────────────────────────────────────────
 api = FastAPI()
-api.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+api.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 @api.get("/")
 def root():
@@ -50,7 +43,7 @@ def get_today():
     today_exp = [e for e in EXPENSES if e["date"].startswith(today)]
     return {"expenses": today_exp, "total": sum(e["amount"] for e in today_exp)}
 
-# ── CATEGORY KEYWORDS ──────────────────────────────────────────
+# ── HELPERS ────────────────────────────────────────────────────
 CAT_KEYWORDS = {
     "Food":          ["jollibee","mcdo","mcdonald","kfc","chowking","mang inasal","ministop","711","7-eleven","grocery","groceries","palengke","market","food","lunch","dinner","breakfast","merienda","snack","restaurant","cafe","pizza","burger"],
     "Transport":     ["grab","angkas","jeep","jeepney","tricycle","bus","lrt","mrt","taxi","uber","toll","gas","petrol","gasoline","diesel","fare","commute","transport"],
@@ -99,19 +92,15 @@ def add_expense(name, amount, category="Other", note="", source="manual"):
 # ── GEMINI ─────────────────────────────────────────────────────
 async def ask_gemini_image(image_bytes):
     if not GEMINI_KEY:
-        logger.warning("No Gemini key set!")
         return None
     try:
         b64 = base64.standard_b64encode(image_bytes).decode()
         prompt = """This is a receipt or payment slip from the Philippines.
 Find: 1) Merchant/store name  2) Total amount paid in Philippine Peso  3) Category
-
 Return ONLY this JSON with no extra text:
 {"name":"MERCHANT","amount":210.00,"category":"Shopping","note":"description"}
-
 Categories: Food, Transport, Utilities, Shopping, Entertainment, Healthcare, Other
 For card slips look for SALE AMOUNT. Merchant name is usually at the top."""
-
         contents = [{"parts": [
             {"inline_data": {"mime_type": "image/jpeg", "data": b64}},
             {"text": prompt}
@@ -119,7 +108,7 @@ For card slips look for SALE AMOUNT. Merchant name is usually at the top."""
         async with httpx.AsyncClient(timeout=30) as client:
             res = await client.post(GEMINI_URL, json={"contents": contents})
             data = res.json()
-            logger.info(f"Gemini response: {data}")
+            logger.info(f"Gemini: {data}")
             if "candidates" not in data:
                 return None
             text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
@@ -132,7 +121,8 @@ For card slips look for SALE AMOUNT. Merchant name is usually at the top."""
 
 # ── BOT COMMANDS ───────────────────────────────────────────────
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    railway_url = os.environ.get("RAILWAY_PUBLIC_DOMAIN", "your-app.railway.app")
+    domain = os.environ.get("RAILWAY_PUBLIC_DOMAIN", "")
+    url_hint = f"\n/link - get sync URL for the app" if domain else ""
     await update.message.reply_text(
         "Hi Jon! Wealth+ Bot here! 🇵🇭\n\n"
         "📸 Send a receipt photo and I'll record it!\n\n"
@@ -145,20 +135,19 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/expenses - recent list\n"
         "/total - by category\n"
         "/today - today only\n"
-        "/delete 5 - remove #5\n"
-        f"/link - get your app sync URL\n\n"
+        f"/delete 5 - remove #5{url_hint}\n\n"
         "Let's track those pesos! 💪"
     )
 
 async def link_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    railway_url = os.environ.get("RAILWAY_PUBLIC_DOMAIN", "")
-    if railway_url:
+    domain = os.environ.get("RAILWAY_PUBLIC_DOMAIN", "")
+    if domain:
         await update.message.reply_text(
-            f"Your sync URL:\nhttps://{railway_url}/expenses\n\n"
-            "Add this URL in your Wealth+ app under Settings → Bot Sync URL to see all bot expenses in the app!"
+            f"Your Bot Sync URL:\n\nhttps://{domain}/expenses\n\n"
+            "Copy this URL and paste it in your Wealth+ app under the 🤖 Bot tab!"
         )
     else:
-        await update.message.reply_text("Sync URL not set yet. Make sure RAILWAY_PUBLIC_DOMAIN is set in Railway Variables.")
+        await update.message.reply_text("Domain not configured yet. Add RAILWAY_PUBLIC_DOMAIN in Railway Variables.")
 
 async def expenses_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not EXPENSES:
@@ -206,17 +195,14 @@ async def delete_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except:
         await update.message.reply_text("Usage: /delete 5")
 
-# ── PHOTO HANDLER ──────────────────────────────────────────────
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await update.message.reply_text("📸 Reading your receipt...")
         file = await context.bot.get_file(update.message.photo[-1].file_id)
         async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.get(file.file_path)
-
         result = await ask_gemini_image(resp.content)
         user_id = update.effective_user.id
-
         if result and result.get("amount", 0) > 0:
             PENDING[user_id] = result
             keyboard = [[
@@ -292,19 +278,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Text error: {e}")
         await update.message.reply_text("Error. Try again!")
 
-# ── RUN BOTH BOT + WEB SERVER ──────────────────────────────────
-def run_api():
-    uvicorn.run(api, host="0.0.0.0", port=PORT)
-
-def main():
-    logger.info("Starting Wealth+ Bot + API...")
-
-    # Start web server in background thread
-    api_thread = threading.Thread(target=run_api, daemon=True)
-    api_thread.start()
-    logger.info(f"Web API running on port {PORT}")
-
-    # Start Telegram bot
+# ── MAIN — run both together using asyncio ─────────────────────
+async def run_bot():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start",    start))
     app.add_handler(CommandHandler("help",     start))
@@ -316,8 +291,21 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling(drop_pending_updates=True)
     logger.info("Bot polling started!")
-    app.run_polling(drop_pending_updates=True)
+    # Keep running forever
+    await asyncio.Event().wait()
+
+async def run_api():
+    config = uvicorn.Config(api, host="0.0.0.0", port=PORT, log_level="info")
+    server = uvicorn.Server(config)
+    await server.serve()
+
+async def main():
+    logger.info(f"Starting Wealth+ Bot + API on port {PORT}...")
+    await asyncio.gather(run_bot(), run_api())
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
