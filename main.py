@@ -4,13 +4,14 @@ import json
 import base64
 import logging
 import asyncio
-from datetime import datetime
+from datetime import datetime, time
+from zoneinfo import ZoneInfo
 
 import httpx
 import uvicorn
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Bot
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 
 logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
@@ -18,10 +19,13 @@ logger = logging.getLogger(__name__)
 
 BOT_TOKEN  = os.environ.get("BOT_TOKEN", "")
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "")
-PORT       = int(os.environ.get("PORT", 8000))
+CHAT_ID    = os.environ.get("CHAT_ID", "1603569746")
+PORT       = int(os.environ.get("PORT", 8080))
+PH_TZ      = ZoneInfo("Asia/Manila")
 GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_KEY}"
 
 EXPENSES = []
+LOANS    = []  # {name, amount, due_day}
 COUNTER  = [0]
 PENDING  = {}
 
@@ -39,7 +43,7 @@ def get_expenses():
 
 @api.get("/today")
 def get_today():
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = datetime.now(PH_TZ).strftime("%Y-%m-%d")
     today_exp = [e for e in EXPENSES if e["date"].startswith(today)]
     return {"expenses": today_exp, "total": sum(e["amount"] for e in today_exp)}
 
@@ -83,7 +87,7 @@ def add_expense(name, amount, category="Other", note="", source="manual"):
         "amount": float(amount),
         "category": str(category),
         "note": str(note),
-        "date": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "date": datetime.now(PH_TZ).strftime("%Y-%m-%d %H:%M"),
         "source": source,
     }
     EXPENSES.append(entry)
@@ -108,7 +112,6 @@ For card slips look for SALE AMOUNT. Merchant name is usually at the top."""
         async with httpx.AsyncClient(timeout=30) as client:
             res = await client.post(GEMINI_URL, json={"contents": contents})
             data = res.json()
-            logger.info(f"Gemini: {data}")
             if "candidates" not in data:
                 return None
             text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
@@ -119,23 +122,122 @@ For card slips look for SALE AMOUNT. Merchant name is usually at the top."""
         logger.error(f"Gemini error: {e}")
     return None
 
+# ── SCHEDULED NOTIFICATIONS ────────────────────────────────────
+async def send_daily_summary(bot: Bot):
+    """Send daily spending summary every 9PM Manila time."""
+    today = datetime.now(PH_TZ).strftime("%Y-%m-%d")
+    today_exp = [e for e in EXPENSES if e["date"].startswith(today)]
+
+    if not today_exp:
+        msg = (
+            "🌙 Good evening Jon!\n\n"
+            "No expenses recorded today.\n"
+            "Don't forget to log your spending! 📝"
+        )
+    else:
+        total = sum(e["amount"] for e in today_exp)
+        by_cat = {}
+        for e in today_exp:
+            by_cat[e["category"]] = by_cat.get(e["category"], 0) + e["amount"]
+        lines = [f"• {cat}: ₱{amt:,.2f}" for cat, amt in sorted(by_cat.items(), key=lambda x: -x[1])]
+        msg = (
+            f"🌙 Daily Summary — {today}\n\n"
+            + "\n".join(lines) +
+            f"\n\n💸 Total today: ₱{total:,.2f}\n\n"
+            "Keep tracking! 💪"
+        )
+    await bot.send_message(chat_id=CHAT_ID, text=msg)
+    logger.info("Daily summary sent!")
+
+async def send_weekly_report(bot: Bot):
+    """Send weekly budget report every Sunday 8PM Manila time."""
+    if not EXPENSES:
+        await bot.send_message(chat_id=CHAT_ID, text="📊 Weekly Report\n\nNo expenses recorded this week yet!")
+        return
+
+    total = sum(e["amount"] for e in EXPENSES)
+    by_cat = {}
+    for e in EXPENSES:
+        by_cat[e["category"]] = by_cat.get(e["category"], 0) + e["amount"]
+    lines = [f"• {cat}: ₱{amt:,.2f}" for cat, amt in sorted(by_cat.items(), key=lambda x: -x[1])]
+    top_cat = max(by_cat.items(), key=lambda x: x[1])[0] if by_cat else "N/A"
+
+    msg = (
+        f"📊 Weekly Report\n\n"
+        f"Total Expenses: ₱{total:,.2f}\n"
+        f"Transactions: {len(EXPENSES)}\n"
+        f"Top Category: {top_cat}\n\n"
+        "Breakdown:\n" + "\n".join(lines) +
+        "\n\nHave a great week ahead! 🇵🇭💪"
+    )
+    await bot.send_message(chat_id=CHAT_ID, text=msg)
+    logger.info("Weekly report sent!")
+
+async def check_due_dates(bot: Bot):
+    """Check loan due dates every morning 8AM Manila time."""
+    if not LOANS:
+        return
+    today = datetime.now(PH_TZ)
+    tomorrow = today.day + 1
+    reminders = []
+    for loan in LOANS:
+        due = loan.get("due_day", 0)
+        if due == today.day:
+            reminders.append(f"🔴 DUE TODAY: {loan['name']} — ₱{loan['amount']:,.2f}")
+        elif due == tomorrow:
+            reminders.append(f"🟡 DUE TOMORROW: {loan['name']} — ₱{loan['amount']:,.2f}")
+        elif due == today.day + 3:
+            reminders.append(f"🟠 DUE IN 3 DAYS: {loan['name']} — ₱{loan['amount']:,.2f}")
+
+    if reminders:
+        msg = "💳 Loan Payment Reminder!\n\n" + "\n".join(reminders) + "\n\nDon't miss your payments! 💪"
+        await bot.send_message(chat_id=CHAT_ID, text=msg)
+        logger.info(f"Due date reminders sent: {len(reminders)}")
+
+async def scheduler(bot: Bot):
+    """Run scheduled tasks based on Manila time."""
+    logger.info("Scheduler started!")
+    while True:
+        now = datetime.now(PH_TZ)
+        hour, minute, weekday = now.hour, now.minute, now.weekday()
+
+        # Daily summary: 9:00 PM every day
+        if hour == 21 and minute == 0:
+            await send_daily_summary(bot)
+
+        # Weekly report: 8:00 PM every Sunday (weekday 6)
+        if hour == 20 and minute == 0 and weekday == 6:
+            await send_weekly_report(bot)
+
+        # Due date check: 8:00 AM every day
+        if hour == 8 and minute == 0:
+            await check_due_dates(bot)
+
+        # Sleep until next minute
+        await asyncio.sleep(60)
+
 # ── BOT COMMANDS ───────────────────────────────────────────────
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    domain = os.environ.get("RAILWAY_PUBLIC_DOMAIN", "")
-    url_hint = f"\n/link - get sync URL for the app" if domain else ""
     await update.message.reply_text(
         "Hi Jon! Wealth+ Bot here! 🇵🇭\n\n"
         "📸 Send a receipt photo and I'll record it!\n\n"
         "Or type an expense:\n"
         "• spent 250 Jollibee\n"
         "• 1500 Meralco\n"
-        "• 210 Aquaflask\n"
-        "• groceries 2300 SM\n\n"
+        "• 210 Aquaflask\n\n"
+        "Auto Notifications:\n"
+        "🌙 9PM — Daily spending summary\n"
+        "📅 8AM — Loan due date reminders\n"
+        "📊 Sunday 8PM — Weekly report\n\n"
         "Commands:\n"
         "/expenses - recent list\n"
         "/total - by category\n"
         "/today - today only\n"
-        f"/delete 5 - remove #5{url_hint}\n\n"
+        "/summary - get summary now\n"
+        "/addloan - add a loan reminder\n"
+        "/loans - see your loans\n"
+        "/delete 5 - remove expense #5\n"
+        "/link - get app sync URL\n\n"
         "Let's track those pesos! 💪"
     )
 
@@ -144,19 +246,55 @@ async def link_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if domain:
         await update.message.reply_text(
             f"Your Bot Sync URL:\n\nhttps://{domain}/expenses\n\n"
-            "Copy this URL and paste it in your Wealth+ app under the 🤖 Bot tab!"
+            "Paste this in your Wealth+ app under the 🤖 Bot tab!"
         )
     else:
-        await update.message.reply_text("Domain not configured yet. Add RAILWAY_PUBLIC_DOMAIN in Railway Variables.")
+        await update.message.reply_text("Domain not set. Add RAILWAY_PUBLIC_DOMAIN in Railway Variables.")
+
+async def summary_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    bot = context.bot
+    await send_daily_summary(bot)
+
+async def addloan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args or len(context.args) < 3:
+        await update.message.reply_text(
+            "Usage: /addloan [name] [amount] [due_day]\n\n"
+            "Example:\n"
+            "/addloan BDO-Credit 5000 15\n"
+            "/addloan Meralco 2500 20\n\n"
+            "due_day = day of month payment is due"
+        )
+        return
+    try:
+        name = context.args[0]
+        amount = float(context.args[1])
+        due_day = int(context.args[2])
+        LOANS.append({"name": name, "amount": amount, "due_day": due_day})
+        await update.message.reply_text(
+            f"Loan reminder added! ✅\n\n"
+            f"📋 {name}\n"
+            f"💸 ₱{amount:,.2f}\n"
+            f"📅 Due every day {due_day} of the month\n\n"
+            f"You'll get reminders 3 days before, 1 day before, and on the due date!"
+        )
+    except:
+        await update.message.reply_text("Error. Example: /addloan BDO-Credit 5000 15")
+
+async def loans_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not LOANS:
+        await update.message.reply_text("No loan reminders yet!\nAdd one: /addloan BDO-Credit 5000 15")
+        return
+    lines = [f"• {l['name']} — ₱{l['amount']:,.2f} (due day {l['due_day']})" for l in LOANS]
+    await update.message.reply_text("Your Loan Reminders:\n\n" + "\n".join(lines))
 
 async def expenses_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not EXPENSES:
         await update.message.reply_text("No expenses yet!\nType: spent 250 Jollibee")
         return
     recent = EXPENSES[-15:][::-1]
-    lines = [f"#{e['id']} {e['name']} - P{e['amount']:,.2f} ({e['category']}) {e['date'][:10]}" for e in recent]
+    lines = [f"#{e['id']} {e['name']} - ₱{e['amount']:,.2f} ({e['category']}) {e['date'][:10]}" for e in recent]
     total = sum(e["amount"] for e in EXPENSES)
-    await update.message.reply_text("Recent Expenses:\n\n" + "\n".join(lines) + f"\n\nTotal: P{total:,.2f}")
+    await update.message.reply_text("Recent Expenses:\n\n" + "\n".join(lines) + f"\n\nTotal: ₱{total:,.2f}")
 
 async def total_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not EXPENSES:
@@ -167,18 +305,18 @@ async def total_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cat = e.get("category","Other")
         by_cat[cat] = by_cat.get(cat, 0) + e["amount"]
     total = sum(e["amount"] for e in EXPENSES)
-    lines = [f"• {cat}: P{amt:,.2f}" for cat, amt in sorted(by_cat.items(), key=lambda x: -x[1])]
-    await update.message.reply_text("Spending by Category:\n\n" + "\n".join(lines) + f"\n\nTotal: P{total:,.2f}")
+    lines = [f"• {cat}: ₱{amt:,.2f}" for cat, amt in sorted(by_cat.items(), key=lambda x: -x[1])]
+    await update.message.reply_text("Spending by Category:\n\n" + "\n".join(lines) + f"\n\nTotal: ₱{total:,.2f}")
 
 async def today_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = datetime.now(PH_TZ).strftime("%Y-%m-%d")
     today_exp = [e for e in EXPENSES if e["date"].startswith(today)]
     if not today_exp:
         await update.message.reply_text("No expenses today yet!")
         return
-    lines = [f"• {e['name']} - P{e['amount']:,.2f} ({e['category']})" for e in today_exp]
+    lines = [f"• {e['name']} - ₱{e['amount']:,.2f} ({e['category']})" for e in today_exp]
     total = sum(e["amount"] for e in today_exp)
-    await update.message.reply_text("Today's Expenses:\n\n" + "\n".join(lines) + f"\n\nToday's Total: P{total:,.2f}")
+    await update.message.reply_text("Today's Expenses:\n\n" + "\n".join(lines) + f"\n\nToday's Total: ₱{total:,.2f}")
 
 async def delete_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
@@ -212,7 +350,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(
                 f"Found this from your receipt:\n\n"
                 f"🏪 Store: {result.get('name','?')}\n"
-                f"💸 Amount: P{float(result.get('amount',0)):,.2f}\n"
+                f"💸 Amount: ₱{float(result.get('amount',0)):,.2f}\n"
                 f"📂 Category: {result.get('category','?')}\n\n"
                 f"Is this correct?",
                 reply_markup=InlineKeyboardMarkup(keyboard)
@@ -240,7 +378,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(
                 f"Saved! ✅\n\n"
                 f"🏪 {entry['name']}\n"
-                f"💸 P{entry['amount']:,.2f}\n"
+                f"💸 ₱{entry['amount']:,.2f}\n"
                 f"📂 {entry['category']}\n"
                 f"📅 {entry['date']}\n\n"
                 f"#{entry['id']} recorded!"
@@ -269,7 +407,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"Saved! ✅\n\n"
             f"🏪 Store: {entry['name']}\n"
-            f"💸 Amount: P{entry['amount']:,.2f}\n"
+            f"💸 Amount: ₱{entry['amount']:,.2f}\n"
             f"📂 Category: {entry['category']}\n"
             f"📅 Date: {entry['date']}\n\n"
             f"#{entry['id']} recorded!"
@@ -278,12 +416,20 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Text error: {e}")
         await update.message.reply_text("Error. Try again!")
 
-# ── MAIN — run both together using asyncio ─────────────────────
+# ── MAIN ───────────────────────────────────────────────────────
+async def run_api():
+    config = uvicorn.Config(api, host="0.0.0.0", port=PORT, log_level="info")
+    server = uvicorn.Server(config)
+    await server.serve()
+
 async def run_bot():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start",    start))
     app.add_handler(CommandHandler("help",     start))
     app.add_handler(CommandHandler("link",     link_cmd))
+    app.add_handler(CommandHandler("summary",  summary_cmd))
+    app.add_handler(CommandHandler("addloan",  addloan_cmd))
+    app.add_handler(CommandHandler("loans",    loans_cmd))
     app.add_handler(CommandHandler("expenses", expenses_cmd))
     app.add_handler(CommandHandler("total",    total_cmd))
     app.add_handler(CommandHandler("today",    today_cmd))
@@ -295,16 +441,12 @@ async def run_bot():
     await app.start()
     await app.updater.start_polling(drop_pending_updates=True)
     logger.info("Bot polling started!")
-    # Keep running forever
+    # Start scheduler with the bot instance
+    asyncio.create_task(scheduler(app.bot))
     await asyncio.Event().wait()
 
-async def run_api():
-    config = uvicorn.Config(api, host="0.0.0.0", port=PORT, log_level="info")
-    server = uvicorn.Server(config)
-    await server.serve()
-
 async def main():
-    logger.info(f"Starting Wealth+ Bot + API on port {PORT}...")
+    logger.info(f"Starting Wealth+ Bot + Scheduler on port {PORT}...")
     await asyncio.gather(run_bot(), run_api())
 
 if __name__ == "__main__":
