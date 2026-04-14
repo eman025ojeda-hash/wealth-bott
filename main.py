@@ -20,6 +20,7 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN  = os.environ.get("BOT_TOKEN", "")
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "")
 CHAT_ID    = os.environ.get("CHAT_ID", "1603569746")
+APP_URL    = os.environ.get("APP_URL", "https://eman025ojeda-hash.github.io/wealth-app")
 PORT       = int(os.environ.get("PORT", 8080))
 PH_TZ      = ZoneInfo("Asia/Manila")
 GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_KEY}"
@@ -444,6 +445,7 @@ async def run_api():
 async def run_bot():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start",    start))
+    app.add_handler(CommandHandler("app",      app_cmd))
     app.add_handler(CommandHandler("help",     start))
     app.add_handler(CommandHandler("link",     link_cmd))
     app.add_handler(CommandHandler("summary",  summary_cmd))
